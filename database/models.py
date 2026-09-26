@@ -13,23 +13,27 @@ Admission   -- one occupancy record: a patient assigned to a bed for a
                truth for "who is where right now" -- see
                services/transfers.py for how the *current* admission is
                resolved when duplicate/active records exist.
-Transfer    -- a derived, append-only log entry describing a patient
-               moving from one ward/bed to another. Transfers are created
-               automatically by the ingestion pipeline when it detects
-               that a patient has more than one currently-active
-               admission (see services/transfers.py), and are also kept
-               for genuinely clean transfer data. They are never used to
-               compute live occupancy directly; they exist for audit and
-               historical reporting.
+Transfer    -- an append-only log entry describing a patient moving from
+               one ward/bed to another. Written directly by
+               services/bed_management.transfer_patient() for a
+               deliberate, UI-driven transfer, and also reconstructed by
+               the ingestion pipeline when it detects that an *uploaded*
+               dataset already contains more than one currently-active
+               admission for a patient (see services/transfers.py).
+               Transfers are never read when computing live occupancy;
+               they exist for audit and historical reporting.
 
 Design notes
 ------------
-* ``Bed.status`` is a *cached/informational* column. The dashboard never
-  trusts it as the source of truth for live occupancy -- occupancy is
-  always recomputed from ``Admission`` rows (see
-  services/occupancy.py). This avoids the two numbers ever silently
-  drifting apart, which is the whole point of the "duplicate active
-  record" bottleneck this project is built around.
+* ``Bed.status`` is an *operational* field (In Service / Out of Service)
+  -- see ``BedServiceStatus``. It is a separate axis from Occupied/Free:
+  the dashboard never treats it as a substitute for live occupancy, which
+  is always recomputed from ``Admission`` rows (see
+  services/occupancy.py). This avoids the two ever silently drifting
+  apart, which is the whole point of the "duplicate active record"
+  bottleneck this project is built around; the service-status field only
+  adds the third state (unavailable for use at all) that Admission rows
+  cannot express on their own.
 * There is deliberately no separate ``Discharge`` table. A discharge is
   simply an ``Admission`` whose ``discharge_time`` is set and whose
   ``status`` is ``Discharged``. Duplicating that into a second table
@@ -85,6 +89,25 @@ class Ward(Base):
         return f"Ward(id={self.id}, name={self.name!r})"
 
 
+class BedServiceStatus(str, enum.Enum):
+    """Valid values for ``Bed.status`` -- an *operational* property of the
+    bed itself (is it available for use at all), independent of whether a
+    patient currently occupies it.
+
+    This is deliberately a separate axis from Occupied/Free: a bed can be
+    In Service and Free, In Service and Occupied, or Out of Service (which
+    implies Free, since a bed must be vacated before it can be taken out
+    of service -- enforced in services/bed_management.py). Live
+    occupancy/free counts are always recomputed from Admission rows (see
+    services/occupancy.py); this column is never treated as a substitute
+    for that -- it only adds the third, operational state that Admission
+    rows cannot express.
+    """
+
+    IN_SERVICE = "In Service"
+    OUT_OF_SERVICE = "Out of Service"
+
+
 class Bed(Base):
     __tablename__ = "beds"
     __table_args__ = (UniqueConstraint("ward_id", "bed_number", name="uq_bed_ward_number"),)
@@ -92,15 +115,15 @@ class Bed(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     ward_id: Mapped[int] = mapped_column(ForeignKey("wards.id"), nullable=False)
     bed_number: Mapped[str] = mapped_column(String(20), nullable=False)
-    # Cached label only -- see module docstring. Live status is always
-    # recomputed from Admission rows by services/occupancy.py.
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="Free")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default=BedServiceStatus.IN_SERVICE.value)
+    out_of_service_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    out_of_service_since: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     ward: Mapped["Ward"] = relationship(back_populates="beds")
     admissions: Mapped[list["Admission"]] = relationship(back_populates="bed")
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
-        return f"Bed(id={self.id}, bed_number={self.bed_number!r}, ward_id={self.ward_id})"
+        return f"Bed(id={self.id}, bed_number={self.bed_number!r}, ward_id={self.ward_id}, status={self.status!r})"
 
 
 class Patient(Base):

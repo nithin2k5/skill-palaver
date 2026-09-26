@@ -95,7 +95,9 @@ def render_bed_legend() -> None:
         <div class="icu-legend">
             <span class="icu-legend-item"><span class="icu-legend-swatch" style="background:{RED};"></span>Occupied</span>
             <span class="icu-legend-item"><span class="icu-legend-swatch" style="background:#f4f5f7;border:1px solid #dde2e9;"></span>Free</span>
-            <span class="icu-legend-item"><span class="icu-legend-swatch" style="background:{AMBER};"></span>Planned discharge (hover a bed for details)</span>
+            <span class="icu-legend-item"><span class="icu-legend-swatch" style="background:repeating-linear-gradient(45deg,#e7e9ed,#e7e9ed 3px,#dadde3 3px,#dadde3 6px);border:1px solid #c9ced7;"></span>Out of service</span>
+            <span class="icu-legend-item"><span class="icu-legend-swatch" style="background:{AMBER};"></span>Planned discharge</span>
+            <span class="icu-legend-item">Hover any bed for details</span>
         </div>
         """
     )
@@ -120,7 +122,11 @@ def render_ward_bed_grid(ward_name: str, ward_beds: pd.DataFrame) -> None:
     services.occupancy.bed_status_board.
     """
     occupied_count = int((ward_beds["status"] == "Occupied").sum())
+    oos_count = int((ward_beds["status"] == "Out of Service").sum())
     total_count = len(ward_beds)
+    count_label = f"{occupied_count}/{total_count} occupied"
+    if oos_count:
+        count_label += f" · {oos_count} OOS"
 
     tiles = []
     for _, bed in ward_beds.sort_values("bed_number").iterrows():
@@ -147,6 +153,17 @@ def render_ward_bed_grid(ward_name: str, ward_beds: pd.DataFrame) -> None:
                 </div>
                 """
             )
+        elif bed["status"] == "Out of Service":
+            reason = bed.get("out_of_service_reason")
+            tooltip = f"Out of service — {reason}" if reason else "Out of service"
+            tiles.append(
+                f"""
+                <div class="icu-bed icu-bed-oos" title="{html.escape(tooltip)}">
+                    <div class="icu-bed-id">{html.escape(str(bed['bed_number']))}</div>
+                    <div class="icu-bed-status">Out of Service</div>
+                </div>
+                """
+            )
         else:
             tiles.append(
                 f"""
@@ -162,7 +179,7 @@ def render_ward_bed_grid(ward_name: str, ward_beds: pd.DataFrame) -> None:
         <div class="icu-ward-block">
             <div class="icu-ward-header">
                 <span class="icu-ward-label">{html.escape(ward_name)}</span>
-                <span class="icu-ward-count">{occupied_count}/{total_count} occupied</span>
+                <span class="icu-ward-count">{html.escape(count_label)}</span>
             </div>
             <div class="icu-bed-grid">{"".join(tiles)}</div>
         </div>

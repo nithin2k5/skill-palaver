@@ -27,6 +27,15 @@ from database.repository import (
     reset_all_data,
 )
 from database.seed import seed_database
+from services.bed_management import (
+    BedManagementError,
+    admit_patient,
+    create_bed,
+    discharge_patient,
+    remove_bed,
+    set_bed_service_status,
+    transfer_patient,
+)
 from services.data_quality import annotate_discharges, build_data_quality_report
 from services.forecasting import forecast_free_beds_tomorrow
 from services.ingestion import RowIssue, persist_admissions, validate_admissions_csv
@@ -136,7 +145,9 @@ def render() -> None:
             selected_ward = st.selectbox("Ward", ward_options, key="filter_ward")
         with f_col2:
             bed_status_filter = st.selectbox(
-                "Bed status (live board)", ["All", "Occupied", "Free"], key="filter_bed_status"
+                "Bed status (live board)",
+                ["All", "Occupied", "Free", "Out of Service"],
+                key="filter_bed_status",
             )
         with f_col3:
             min_date, max_date = _admission_date_bounds(admissions_df)
@@ -160,7 +171,10 @@ def render() -> None:
     occ = compute_occupancy(ward_filtered_beds, ward_filtered_resolved)
     today = dt.date.today()
     forecast = forecast_free_beds_tomorrow(
-        total_beds=occ.total_beds,
+        # Capped at beds actually available for use -- an out-of-service
+        # bed can never become a "free" bed tomorrow just because a
+        # discharge is planned elsewhere.
+        total_beds=occ.in_service_beds,
         currently_free=occ.free_beds,
         resolved_admissions=ward_filtered_resolved,
         reference_date=today,
@@ -170,16 +184,17 @@ def render() -> None:
         if not ward_filtered_resolved.empty
         else 0
     )
-    render_metric_row(
-        [
-            ("Total ICU Beds", occ.total_beds, "beds", ""),
-            ("Occupied Beds", occ.occupied_beds, "beds", "red"),
-            ("Free Beds", occ.free_beds, "beds", "blue"),
-            ("Occupancy", f"{occ.occupancy_pct}", "%", "red" if occ.occupancy_pct >= 85 else ""),
-            ("Planned Discharges", planned_total, "patients", "amber"),
-            ("Forecast Free Tomorrow", forecast.forecast_free_tomorrow, "beds", "blue"),
-        ]
-    )
+    metric_tiles = [
+        ("Total ICU Beds", occ.total_beds, "beds", ""),
+        ("Occupied Beds", occ.occupied_beds, "beds", "red"),
+        ("Free Beds", occ.free_beds, "beds", "blue"),
+        ("Occupancy", f"{occ.occupancy_pct}", "%", "red" if occ.occupancy_pct >= 85 else ""),
+        ("Planned Discharges", planned_total, "patients", "amber"),
+        ("Forecast Free Tomorrow", forecast.forecast_free_tomorrow, "beds", "blue"),
+    ]
+    if occ.out_of_service_beds:
+        metric_tiles.insert(3, ("Out of Service", occ.out_of_service_beds, "beds", ""))
+    render_metric_row(metric_tiles)
 
     # ---------------------------------------------------------- Live bed board
     render_section_title(
@@ -196,14 +211,24 @@ def render() -> None:
             for ward_name, ward_group in board.groupby("ward", sort=True):
                 render_ward_bed_grid(ward_name, ward_group)
 
+    # ------------------------------------------------------ Manage beds & patients
+    render_section_title(
+        "04",
+        "Manage Beds & Patients",
+        "Admit, discharge or transfer a patient, or change the bed roster -- dataset-wide, ward filter does not apply.",
+    )
+    with st.container(border=True):
+        full_board = bed_status_board(beds_df, resolution.resolved)
+        _render_bed_management(wards_df, beds_df, full_board, resolution.resolved, admissions_df)
+
     # ------------------------------------------------------------------ Charts
-    render_section_title("04", "Charts")
+    render_section_title("05", "Charts")
     with st.container(border=True):
         _render_charts(beds_df, resolution.resolved, admissions_df, selected_ward)
 
     # --------------------------------------------------------- Next-day forecast
     render_section_title(
-        "05", "Next-Day Forecast", "forecast = min(total beds, currently free + planned discharges tomorrow)"
+        "06", "Next-Day Forecast", "forecast = min(total beds, currently free + planned discharges tomorrow)"
     )
     render_metric_row(
         [
@@ -215,14 +240,14 @@ def render() -> None:
 
     # ------------------------------------------------------------- Data quality
     render_section_title(
-        "06",
+        "07",
         "Data Quality",
         "Issues detected in the underlying admissions data (ward filter does not apply -- these are dataset-wide).",
     )
     _render_data_quality(admissions_df, resolution.duplicates, resolution.transfers, invalid_beds)
 
     # --------------------------------------------------------- Admissions table
-    render_section_title("07", "Admissions / Patient Table", "Underlying records, one row per admission (all statuses).")
+    render_section_title("08", "Admissions / Patient Table", "Underlying records, one row per admission (all statuses).")
     with st.container(border=True):
         _render_admissions_table(admissions_df, selected_ward, date_range)
 
@@ -350,6 +375,245 @@ def _render_import_report(report: dict) -> None:
     if report["warnings"]:
         with st.expander(f"{len(report['warnings'])} warning(s)", expanded=False):
             st.dataframe(pd.DataFrame(report["warnings"]), width="stretch", hide_index=True)
+
+
+# ============================================================================
+# Manage Beds & Patients -- admit / discharge / transfer a single patient,
+# and add / remove / retire beds. Deliberately scoped to the *full* dataset
+# (not the page's ward filter) so an administrator can always act on any
+# bed regardless of what they happen to be viewing.
+# ============================================================================
+
+def _render_bed_management(
+    wards_df: pd.DataFrame,
+    beds_df: pd.DataFrame,
+    board: pd.DataFrame,
+    resolved: pd.DataFrame,
+    admissions_df: pd.DataFrame,
+) -> None:
+    ward_names = sorted(wards_df["name"].tolist())
+    tab_admit, tab_discharge, tab_roster = st.tabs(["Admit Patient", "Discharge / Transfer", "Bed Roster"])
+
+    with tab_admit:
+        _render_admit_tab(ward_names, board)
+    with tab_discharge:
+        _render_discharge_transfer_tab(ward_names, board, resolved)
+    with tab_roster:
+        _render_bed_roster_tab(ward_names, beds_df, board, admissions_df)
+
+
+def _bed_options(board: pd.DataFrame, ward_name: str, status: str) -> list[str]:
+    subset = board[(board["ward"] == ward_name) & (board["status"] == status)]
+    return sorted(subset["bed_number"].tolist())
+
+
+def _render_admit_tab(ward_names: list[str], board: pd.DataFrame) -> None:
+    if not ward_names:
+        st.caption("No wards yet -- add one from the Bed Roster tab first.")
+        return
+
+    st.caption("Puts a patient into a specific free, in-service bed.")
+    # The ward select lives outside the form so the bed list below it
+    # updates immediately when the ward changes (widgets inside a form do
+    # not trigger a rerun until submit).
+    ward_name = st.selectbox("Ward", ward_names, key="admit_ward")
+    free_beds = _bed_options(board, ward_name, "Free")
+
+    with st.form("admit_patient_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            patient_id = st.text_input("Patient ID", placeholder="e.g. P014")
+            bed_number = st.selectbox(
+                "Free bed", free_beds or ["No free beds in this ward"], disabled=not free_beds
+            )
+        with c2:
+            admission_time = st.datetime_input("Admission time", value=dt.datetime.now(), step=300)
+            has_plan = st.checkbox("Planned discharge date is known")
+            planned_date = (
+                st.date_input("Planned discharge date", value=dt.date.today() + dt.timedelta(days=2))
+                if has_plan
+                else None
+            )
+        allow_duplicate = st.checkbox(
+            "Admit anyway if this patient already has an active admission elsewhere "
+            "(creates a duplicate-active record, flagged under Data Quality)"
+        )
+        submitted = st.form_submit_button("Admit patient", width="stretch")
+
+    if submitted:
+        if not free_beds:
+            st.error("There is no free bed in this ward to admit into.")
+            return
+        try:
+            with session_scope() as session:
+                admit_patient(
+                    session,
+                    patient_identifier=patient_id,
+                    ward_name=ward_name,
+                    bed_number=bed_number,
+                    admission_time=admission_time,
+                    planned_discharge_date=planned_date,
+                    allow_duplicate_active=allow_duplicate,
+                )
+            st.success(f"Admitted {patient_id} to {ward_name}/{bed_number}.")
+            st.rerun()
+        except BedManagementError as e:
+            st.error(str(e))
+
+
+def _render_discharge_transfer_tab(ward_names: list[str], board: pd.DataFrame, resolved: pd.DataFrame) -> None:
+    if resolved.empty:
+        st.caption("No occupied beds to discharge or transfer.")
+        return
+
+    occupied = resolved.sort_values(["ward", "bed_number"])
+    options = {
+        f"{row.ward} / {row.bed_number} — {row.patient_identifier}": row.admission_id
+        for row in occupied.itertuples()
+    }
+    label = st.selectbox("Select an occupied bed", list(options.keys()), key="dt_select")
+    admission_id = options[label]
+    selected = occupied[occupied["admission_id"] == admission_id].iloc[0]
+
+    action = st.radio("Action", ["Discharge", "Transfer"], horizontal=True, key="dt_action")
+
+    if action == "Discharge":
+        with st.form("discharge_form", clear_on_submit=True):
+            discharge_time = st.datetime_input("Discharge time", value=dt.datetime.now(), step=60)
+            st.caption(
+                "Tip: set a time between 00:00 and the operational cutoff hour to see the "
+                "early-morning discharge flag in Data Quality."
+            )
+            submitted = st.form_submit_button("Discharge patient", width="stretch")
+        if submitted:
+            try:
+                with session_scope() as session:
+                    discharge_patient(session, admission_id=int(admission_id), discharge_time=discharge_time)
+                st.success(f"Discharged {selected['patient_identifier']} from {selected['ward']}/{selected['bed_number']}.")
+                st.session_state.pop("dt_select", None)
+                st.rerun()
+            except BedManagementError as e:
+                st.error(str(e))
+    else:
+        remaining_wards = ward_names
+        dest_ward = st.selectbox("Destination ward", remaining_wards, key="dt_dest_ward")
+        dest_free_beds = _bed_options(board, dest_ward, "Free")
+        with st.form("transfer_form", clear_on_submit=True):
+            dest_bed = st.selectbox(
+                "Destination bed", dest_free_beds or ["No free beds in this ward"], disabled=not dest_free_beds
+            )
+            transfer_time = st.datetime_input("Transfer time", value=dt.datetime.now(), step=60)
+            submitted = st.form_submit_button("Transfer patient", width="stretch")
+        if submitted:
+            if not dest_free_beds:
+                st.error("There is no free bed in that ward to transfer into.")
+            else:
+                try:
+                    with session_scope() as session:
+                        transfer_patient(
+                            session,
+                            admission_id=int(admission_id),
+                            to_ward_name=dest_ward,
+                            to_bed_number=dest_bed,
+                            transfer_time=transfer_time,
+                        )
+                    st.success(f"Transferred {selected['patient_identifier']} to {dest_ward}/{dest_bed}.")
+                    st.session_state.pop("dt_select", None)
+                    st.rerun()
+                except BedManagementError as e:
+                    st.error(str(e))
+
+
+def _render_bed_roster_tab(
+    ward_names: list[str], beds_df: pd.DataFrame, board: pd.DataFrame, admissions_df: pd.DataFrame
+) -> None:
+    st.markdown("**Add a bed**")
+    with st.form("add_bed_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            ward_choice = st.selectbox("Ward", ward_names, key="add_bed_ward") if ward_names else None
+            new_ward = st.text_input("...or a new ward name", placeholder="e.g. ICU-D")
+        with c2:
+            bed_number = st.text_input("Bed number", placeholder="e.g. D01")
+        submitted = st.form_submit_button("Add bed", width="stretch")
+    if submitted:
+        ward_name = new_ward.strip() or ward_choice
+        if not ward_name:
+            st.error("Choose an existing ward or enter a new ward name.")
+        else:
+            try:
+                with session_scope() as session:
+                    create_bed(session, ward_name=ward_name, bed_number=bed_number)
+                st.success(f"Added bed {ward_name}/{bed_number}.")
+                st.rerun()
+            except BedManagementError as e:
+                st.error(str(e))
+
+    st.markdown("---")
+    st.markdown("**Remove a bed**")
+    never_used_ids = set(beds_df["id"]) - (set(admissions_df["bed_id"].unique()) if not admissions_df.empty else set())
+    removable = board[board["bed_id"].isin(never_used_ids) & (board["status"] == "Free")]
+    if removable.empty:
+        st.caption(
+            "No beds are eligible for removal. Only a free bed with no admission history can "
+            "be deleted (to protect the audit trail) -- use Out of Service below for anything else."
+        )
+    else:
+        options = {f"{r.ward} / {r.bed_number}": r.bed_id for r in removable.sort_values(["ward", "bed_number"]).itertuples()}
+        label = st.selectbox("Bed (never used, free)", list(options.keys()), key="remove_bed_select")
+        if st.button("Remove bed", key="remove_bed_button"):
+            try:
+                with session_scope() as session:
+                    remove_bed(session, bed_id=int(options[label]))
+                st.success(f"Removed bed {label}.")
+                st.session_state.pop("remove_bed_select", None)
+                st.rerun()
+            except BedManagementError as e:
+                st.error(str(e))
+
+    st.markdown("---")
+    st.markdown("**Out of service**")
+    oos_col1, oos_col2 = st.columns(2)
+    with oos_col1:
+        free_beds = board[board["status"] == "Free"]
+        if free_beds.empty:
+            st.caption("No free beds available to take out of service.")
+        else:
+            options = {f"{r.ward} / {r.bed_number}": r.bed_id for r in free_beds.sort_values(["ward", "bed_number"]).itertuples()}
+            label = st.selectbox("Take out of service", list(options.keys()), key="oos_select")
+            reason = st.text_input("Reason (optional)", key="oos_reason", placeholder="e.g. Equipment maintenance")
+            if st.button("Mark out of service", key="oos_button"):
+                try:
+                    with session_scope() as session:
+                        set_bed_service_status(
+                            session, bed_id=int(options[label]), new_status="Out of Service", reason=reason
+                        )
+                    st.success(f"{label} marked out of service.")
+                    st.session_state.pop("oos_select", None)
+                    st.rerun()
+                except BedManagementError as e:
+                    st.error(str(e))
+    with oos_col2:
+        oos_beds = board[board["status"] == "Out of Service"]
+        if oos_beds.empty:
+            st.caption("No beds are currently out of service.")
+        else:
+            options2 = {}
+            for r in oos_beds.sort_values(["ward", "bed_number"]).itertuples():
+                label = f"{r.ward} / {r.bed_number}"
+                if r.out_of_service_reason:
+                    label += f" — {r.out_of_service_reason}"
+                options2[label] = r.bed_id
+            label2 = st.selectbox("Return to service", list(options2.keys()), key="return_service_select")
+            if st.button("Return to service", key="return_service_button"):
+                try:
+                    with session_scope() as session:
+                        set_bed_service_status(session, bed_id=int(options2[label2]), new_status="In Service")
+                    st.success(f"{label2} returned to service.")
+                    st.session_state.pop("return_service_select", None)
+                    st.rerun()
+                except BedManagementError as e:
+                    st.error(str(e))
 
 
 def _render_charts(beds_df: pd.DataFrame, resolved: pd.DataFrame, admissions_df: pd.DataFrame, selected_ward: str) -> None:

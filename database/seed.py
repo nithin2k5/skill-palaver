@@ -34,7 +34,8 @@ import datetime as dt
 import pandas as pd
 from sqlalchemy.orm import Session
 
-from database.repository import ensure_wards_and_beds, reset_all_data
+from database.repository import ensure_wards_and_beds, get_bed_by_ward_and_number, reset_all_data
+from services.bed_management import set_bed_service_status
 from services.ingestion import REQUIRED_COLUMNS, persist_admissions, validate_admissions_csv
 
 WARD_BEDS: dict[str, list[str]] = {
@@ -157,3 +158,13 @@ def seed_database(session: Session, *, reset: bool = True, today: dt.date | None
         raise RuntimeError(f"Sample dataset failed validation: {reasons}")
 
     persist_admissions(session, report.valid_rows)
+
+    # Demonstrate the third bed state (In Service / Out of Service is a
+    # separate axis from Occupied / Free -- see BedServiceStatus) on a
+    # bed that would otherwise just be another empty "Free" tile, through
+    # the same service function the UI's Bed Roster tab uses.
+    b03 = get_bed_by_ward_and_number(session, "ICU-B", "B03")
+    if b03 is not None:
+        set_bed_service_status(
+            session, b03.id, "Out of Service", reason="Equipment maintenance", changed_at=_ts(-1, 7, 0, today=today or dt.date.today())
+        )

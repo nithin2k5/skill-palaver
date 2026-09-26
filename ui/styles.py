@@ -312,6 +312,12 @@ div[data-testid="stHorizontalBlock"] {{ gap: 0.85rem; align-items: stretch; }}
     color: #ffffff;
     cursor: help;
 }}
+.icu-bed-oos {{
+    background: repeating-linear-gradient(45deg, #e7e9ed, #e7e9ed 7px, #dadde3 7px, #dadde3 14px);
+    color: var(--muted);
+    border: 1px solid #c9ced7;
+    cursor: help;
+}}
 .icu-bed-id {{ font-size: 0.8rem; font-weight: 700; letter-spacing: 0.02em; }}
 .icu-bed-status {{
     font-size: 0.6rem;

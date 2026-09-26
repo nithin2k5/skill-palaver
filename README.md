@@ -32,19 +32,20 @@ nothing is hard-coded.
 │   ├── repository.py    # Read queries + reset/seed helpers -- the only place that runs SQL
 │   └── seed.py           # Realistic sample dataset, relative to "today"
 │
-├── services/             # Pure business logic, no Streamlit/SQL imports
-│   ├── ingestion.py       # CSV validation + persistence
-│   ├── transfers.py       # Duplicate-active-record & transfer resolution
-│   ├── occupancy.py       # Bed/occupancy math
-│   ├── forecasting.py     # Next-day bed forecast
+├── services/             # Business logic
+│   ├── ingestion.py       # Bulk CSV validation + persistence
+│   ├── bed_management.py  # One-at-a-time writes: admit/discharge/transfer, bed roster
+│   ├── transfers.py       # Duplicate-active-record & transfer resolution (pure, no DB imports)
+│   ├── occupancy.py       # Bed/occupancy math (pure, no DB imports)
+│   ├── forecasting.py     # Next-day bed forecast (pure, no DB imports)
 │   └── data_quality.py    # Midnight-discharge rule + data-quality aggregation
 │
 ├── ui/
-│   ├── styles.py          # CSS matching the reference design
+│   ├── styles.py          # CSS design system (also native-widget theming)
 │   ├── components.py      # Reusable render helpers (header, metrics, bed grid, ...)
 │   └── dashboard.py        # Page assembly -- orchestrates services + components
 │
-└── tests/                 # 27 unit tests, see "Running tests" below
+└── tests/                 # 48 unit tests, see "Running tests" below
 ```
 
 ## Installation
@@ -79,10 +80,13 @@ pytest
 pytest -v
 ```
 
-27 tests cover occupancy math, forecasting, duplicate/transfer
-resolution, the midnight-discharge rule, and CSV validation/error
-handling (missing columns, missing fields, bad dates, invalid status
-values, unknown wards).
+48 tests cover occupancy math, forecasting, duplicate/transfer
+resolution, the midnight-discharge rule, CSV validation/error handling
+(missing columns, missing fields, bad dates, invalid status values,
+unknown wards), and the bed/patient management actions (admit, discharge,
+transfer, add/remove a bed, take a bed in/out of service, and every
+rejection path -- occupied bed, out-of-service bed, bed with admission
+history, transfer time before admission time, and so on).
 
 ## How it works
 
@@ -122,6 +126,18 @@ detects the different problem of two different patients both resolving
 onto the same bed (e.g. a bed-id typo), reported as "Invalid Bed
 Assignments".
 
+This reconstruction path is for *messy, already-imported* data (a CSV
+that already contains the problem). A deliberate transfer started from
+the **Manage Beds & Patients** panel goes through
+`services/bed_management.transfer_patient` instead, which does the clean
+version directly: it closes the old admission (`Discharged`, with
+`discharge_time` set) and opens a new one in the destination bed in the
+same transaction, so it is never flagged as a duplicate -- and it writes
+a `Transfer` row straight to the database rather than reconstructing one
+later. The sample data's P005 (an unresolved duplicate) and P009 (a
+clean, already-closed-out transfer) exist side by side specifically to
+show both outcomes.
+
 ## Midnight-discharge handling
 
 **Problem:** a discharge logged at 23:55 and one logged at 00:05 the next
@@ -156,11 +172,43 @@ forecast_free_beds_tomorrow = min(
 `planned_discharges_tomorrow` counts currently-occupied (post
 duplicate-resolution) patients whose `planned_discharge_date` equals
 tomorrow. The result is capped at `total_beds` so a data mistake can
-never report more free beds than physically exist. The model is
-implemented behind a small `ForecastModel` protocol
+never report more free beds than physically exist -- in practice the
+dashboard passes the **in-service** bed count as that cap (see below), so
+a bed under maintenance can never be forecast as "available tomorrow."
+The model is implemented behind a small `ForecastModel` protocol
 (`services/forecasting.py`) so a more advanced model (e.g. one that
 weighs historical discharge-delay rates) can be added later without
 touching the UI.
+
+## Managing beds and patients
+
+The **Manage Beds & Patients** section (dataset-wide -- the ward filter
+above it doesn't scope these actions) covers the three things a CSV
+re-upload can't do one at a time, all through `services/bed_management.py`:
+
+* **Admit a patient** into a specific free, in-service bed, with an
+  admission time and an optional planned discharge date. If the patient
+  already has an active admission elsewhere, admitting them again is
+  blocked unless you explicitly confirm it -- which deliberately lets you
+  reproduce the duplicate-active-record scenario on demand rather than
+  making it impossible to happen.
+* **Discharge or transfer** an occupied bed's patient. Discharge sets
+  `discharge_time` (try a time just after midnight to see the
+  early-morning-discharge flag). Transfer performs the clean
+  close-old/open-new sequence described above.
+* **Manage the bed roster**: add a bed to an existing or brand-new ward;
+  remove a bed (only allowed if it's free and has no admission history --
+  a bed with real history can't be deleted without breaking the audit
+  trail); and take a bed **out of service** (with an optional reason) or
+  bring it back. Out of service is a third state alongside Occupied/Free
+  -- it's excluded from "Free Beds" and from the occupancy-percentage
+  denominator (occupancy is measured against beds actually available for
+  use), and forecasting can never count it as free tomorrow. A bed must
+  be vacated before it can be taken out of service.
+
+Every action validates in `services/bed_management.py` before touching
+the database and raises a `BedManagementError` with a plain-English
+message on failure -- shown via `st.error`, never a stack trace.
 
 ## Sample data
 
@@ -175,7 +223,8 @@ scenario the dashboard is built to handle:
 | Early-morning discharge | P006: discharged at 00:15 |
 | Invalid bed assignment | P012 and P013 both recorded on bed C02 |
 | Multiple planned discharges, several dates | P001, P002, P007, P008, P009, P011, P012 |
-| Genuinely free (never-used) beds | A05, B03, C03, C04 |
+| Genuinely free (never-used) beds | A05, C03, C04 |
+| Bed out of service | B03 (equipment maintenance) |
 
 `data/sample_admissions.csv` is a static example file in the exact
 CSV format the app expects (with fixed illustrative dates) -- upload it

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 from sqlalchemy.orm import Session
 
-from database.models import Admission, AdmissionStatus, Bed, Patient, Ward
+from database.models import Admission, AdmissionStatus, Bed, BedServiceStatus, Patient, Ward
 
 REQUIRED_COLUMNS: list[str] = [
     "patient_id",
@@ -258,7 +258,7 @@ def persist_admissions(session: Session, valid_rows: pd.DataFrame) -> list[str]:
         bed_key = (ward.id, record["bed_id"])
         bed = bed_cache.get(bed_key)
         if bed is None:
-            bed = Bed(ward_id=ward.id, bed_number=record["bed_id"], status="Free")
+            bed = Bed(ward_id=ward.id, bed_number=record["bed_id"], status=BedServiceStatus.IN_SERVICE.value)
             session.add(bed)
             session.flush()
             bed_cache[bed_key] = bed

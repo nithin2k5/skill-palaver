@@ -13,7 +13,7 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from database.models import Admission, Bed, Patient, Ward
+from database.models import Admission, Bed, BedServiceStatus, Patient, Ward
 
 
 def load_wards(session: Session) -> pd.DataFrame:
@@ -22,12 +22,80 @@ def load_wards(session: Session) -> pd.DataFrame:
 
 
 def load_beds(session: Session) -> pd.DataFrame:
-    """All beds, joined with their ward name."""
+    """All beds, joined with their ward name, including operational status."""
     rows = session.execute(
-        select(Bed.id, Bed.bed_number, Bed.ward_id, Ward.name.label("ward"))
+        select(
+            Bed.id,
+            Bed.bed_number,
+            Bed.ward_id,
+            Ward.name.label("ward"),
+            Bed.status,
+            Bed.out_of_service_reason,
+            Bed.out_of_service_since,
+        )
         .join(Ward, Bed.ward_id == Ward.id)
     ).all()
-    return pd.DataFrame(rows, columns=["id", "bed_number", "ward_id", "ward"])
+    columns = ["id", "bed_number", "ward_id", "ward", "status", "out_of_service_reason", "out_of_service_since"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def get_ward_by_name(session: Session, name: str) -> Ward | None:
+    return session.query(Ward).filter(Ward.name == name).one_or_none()
+
+
+def get_or_create_ward(session: Session, name: str) -> Ward:
+    ward = get_ward_by_name(session, name)
+    if ward is None:
+        ward = Ward(name=name)
+        session.add(ward)
+        session.flush()
+    return ward
+
+
+def get_bed_by_ward_and_number(session: Session, ward_name: str, bed_number: str) -> Bed | None:
+    return (
+        session.query(Bed)
+        .join(Ward, Bed.ward_id == Ward.id)
+        .filter(Ward.name == ward_name, Bed.bed_number == bed_number)
+        .one_or_none()
+    )
+
+
+def get_bed_by_id(session: Session, bed_id: int) -> Bed | None:
+    return session.get(Bed, bed_id)
+
+
+def bed_has_admission_history(session: Session, bed_id: int) -> bool:
+    return session.query(Admission.id).filter(Admission.bed_id == bed_id).first() is not None
+
+
+def bed_has_active_admission(session: Session, bed_id: int) -> bool:
+    return (
+        session.query(Admission.id)
+        .filter(Admission.bed_id == bed_id, Admission.status == "Occupied")
+        .first()
+        is not None
+    )
+
+
+def get_patient_by_identifier(session: Session, patient_identifier: str) -> Patient | None:
+    return session.query(Patient).filter(Patient.patient_identifier == patient_identifier).one_or_none()
+
+
+def get_active_admission_for_patient(session: Session, patient_id: int) -> Admission | None:
+    """The most recent 'Occupied' admission for a patient, if any.
+
+    Mirrors services.transfers.resolve_active_admissions' "latest wins"
+    rule for a single patient, without needing a full DataFrame resolve
+    -- used by services/bed_management.py to find what to discharge or
+    transfer.
+    """
+    return (
+        session.query(Admission)
+        .filter(Admission.patient_id == patient_id, Admission.status == "Occupied")
+        .order_by(Admission.admission_time.desc())
+        .first()
+    )
 
 
 def load_admissions(session: Session) -> pd.DataFrame:
@@ -117,5 +185,7 @@ def ensure_wards_and_beds(session: Session, ward_to_bed_numbers: dict[str, list[
         }
         for bed_number in bed_numbers:
             if bed_number not in existing_bed_numbers:
-                session.add(Bed(ward_id=ward.id, bed_number=bed_number, status="Free"))
+                session.add(
+                    Bed(ward_id=ward.id, bed_number=bed_number, status=BedServiceStatus.IN_SERVICE.value)
+                )
     session.flush()
