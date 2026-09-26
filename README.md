@@ -22,18 +22,14 @@ nothing is hard-coded.
 ├── .env.example                    # Copy to .env to override configuration
 ├── .streamlit/config.toml          # Theme + "no raw tracebacks to users"
 │
-├── data/
-│   ├── sample_admissions.csv           # Clean example admissions sheet
-│   └── sample_admissions_with_errors.csv  # Deliberately flawed, for testing validation
-│
 ├── database/
 │   ├── models.py        # SQLAlchemy ORM models (Ward, Bed, Patient, Admission, Transfer)
-│   ├── database.py      # Engine/session setup (swap DATABASE_URL for Postgres later)
+│   ├── database.py      # Engine/session setup (swap DATABASE_URL for Postgres/Neon)
 │   ├── repository.py    # Read queries + reset/seed helpers -- the only place that runs SQL
 │   └── seed.py           # Realistic sample dataset, relative to "today"
 │
 ├── services/             # Business logic
-│   ├── ingestion.py       # Bulk CSV validation + persistence
+│   ├── ingestion.py       # Bulk validation + persistence (used internally by seeding)
 │   ├── bed_management.py  # One-at-a-time writes: admit/discharge/transfer, bed roster
 │   ├── transfers.py       # Duplicate-active-record & transfer resolution (pure, no DB imports)
 │   ├── occupancy.py       # Bed/occupancy math (pure, no DB imports)
@@ -130,12 +126,16 @@ history, transfer time before admission time, and so on).
    small read-oriented repository (`database/repository.py`). Pointing it
    at a managed Postgres instead -- Neon included -- is a one-line change:
    set `DATABASE_URL` in `.env`. See "Using Neon" below.
-2. **Every admissions row -- sample or uploaded -- goes through the same
-   pipeline**: `services/ingestion.py` validates the CSV (required
-   columns, required fields, parseable dates, valid status values) and
-   reports precisely which rows were rejected and why, then
-   `persist_admissions` writes the valid rows, auto-creating any new
-   ward/bed/patient it encounters.
+2. **The sample dataset goes through a real validation pipeline, not a
+   direct insert**: `database/seed.py` builds the admissions rows and
+   pushes them through `services/ingestion.py` (required columns,
+   required fields, parseable dates, valid status values) exactly as an
+   uploaded sheet would have been validated, then `persist_admissions`
+   writes the valid rows, auto-creating any new ward/bed/patient it
+   encounters. There is no live upload UI -- day-to-day changes go
+   through **Manage Beds & Patients** (admit/discharge/transfer, bed
+   roster) instead, which is dataset-wide and doesn't require replacing
+   the whole dataset for a single change.
 3. **The UI (`ui/dashboard.py`) never talks to the database or does
    business math directly** -- it loads DataFrames from the repository,
    passes them through `services/*`, and hands the results to
@@ -161,9 +161,9 @@ detects the different problem of two different patients both resolving
 onto the same bed (e.g. a bed-id typo), reported as "Invalid Bed
 Assignments".
 
-This reconstruction path is for *messy, already-imported* data (a CSV
-that already contains the problem). A deliberate transfer started from
-the **Manage Beds & Patients** panel goes through
+This reconstruction path is for *messy, already-imported* data (the
+sample/seed data contains the problem on purpose). A deliberate transfer
+started from the **Manage Beds & Patients** panel goes through
 `services/bed_management.transfer_patient` instead, which does the clean
 version directly: it closes the old admission (`Discharged`, with
 `discharge_time` set) and opens a new one in the destination bed in the
@@ -218,8 +218,9 @@ touching the UI.
 ## Managing beds and patients
 
 The **Manage Beds & Patients** section (dataset-wide -- the ward filter
-above it doesn't scope these actions) covers the three things a CSV
-re-upload can't do one at a time, all through `services/bed_management.py`:
+above it doesn't scope these actions) is how day-to-day changes actually
+happen -- one admission, discharge, transfer or bed roster change at a
+time, all through `services/bed_management.py`:
 
 * **Admit a patient** into a specific free, in-service bed, with an
   admission time and an optional planned discharge date. If the patient
@@ -261,24 +262,25 @@ scenario the dashboard is built to handle:
 | Genuinely free (never-used) beds | A05, C03, C04 |
 | Bed out of service | B03 (equipment maintenance) |
 
-`data/sample_admissions.csv` is a static example file in the exact
-CSV format the app expects (with fixed illustrative dates) -- upload it
-from the "Import / manage admissions data" panel to see the upload flow.
-`data/sample_admissions_with_errors.csv` is deliberately broken (missing
-patient/ward/bed, an unparseable date, an invalid status, an unknown
-ward) to demonstrate the validation error reporting.
-
 ## Error handling
 
-CSV uploads are validated before anything touches the database: missing
-required columns reject the whole file with a clear message; a row
-missing a required field, with an unparseable date, or an invalid status
-value is rejected individually (with the row number and reason shown to
-the user) without discarding the rest of the file. An unknown ward name
-is not an error -- it is created automatically and reported. Any
-unexpected error while rendering the dashboard is caught in `app.py`,
-logged for operators, and shown to the user as a plain message -- never a
-raw Python traceback.
+There is no CSV upload in the UI, but the same strict validation that
+kind of interface would need still runs every time the sample dataset is
+(re-)seeded, in `services/ingestion.py` -- see `tests/test_ingestion.py`
+for the exact rules (missing required columns, a missing required field,
+an unparseable date, an invalid status value, an unknown ward that gets
+auto-created rather than rejected). It stays in place because
+`database/seed.py` depends on it, and because it is the natural place to
+plug a real bulk-import path back in later without redesigning the
+validation rules.
+
+Day-to-day changes go through **Manage Beds & Patients** instead, and
+every action there (admit, discharge, transfer, add/remove a bed,
+in/out of service) is validated in `services/bed_management.py` before
+touching the database, raising a `BedManagementError` with a
+plain-English message on failure. Any other unexpected error while
+rendering the dashboard is caught in `app.py`, logged for operators, and
+shown to the user as a plain message -- never a raw Python traceback.
 
 ## Security & production considerations
 

@@ -10,7 +10,6 @@ lives here.
 from __future__ import annotations
 
 import datetime as dt
-import io
 
 import pandas as pd
 import plotly.express as px
@@ -24,7 +23,6 @@ from database.repository import (
     load_admissions,
     load_beds,
     load_wards,
-    reset_all_data,
 )
 from database.seed import seed_database
 from services.bed_management import (
@@ -38,7 +36,6 @@ from services.bed_management import (
 )
 from services.data_quality import annotate_discharges, build_data_quality_report
 from services.forecasting import forecast_free_beds_tomorrow
-from services.ingestion import RowIssue, persist_admissions, validate_admissions_csv
 from services.occupancy import bed_status_board, compute_occupancy
 from services.transfers import find_invalid_bed_assignments, resolve_active_admissions
 from ui.components import (
@@ -118,20 +115,15 @@ def render() -> None:
     )
     render_header(PROJECT_ID, PROJECT_TITLE, PROJECT_DOMAIN, stats_line)
 
-    _render_data_source_section()
-
-    # Re-read after a possible import/reset triggered above.
-    with session_scope() as session:
-        wards_df = load_wards(session)
-        beds_df = load_beds(session)
-        admissions_df = load_admissions(session)
-
     if beds_df.empty:
+        # Not a hard stop -- every section below already tolerates empty
+        # data, and Manage Beds & Patients (which still renders) is the
+        # only way to add a bed back now that there is no CSV import to
+        # fall back on.
         render_callout(
-            "No beds are configured yet. Upload an admissions sheet above, "
-            "or reset to the sample dataset, to populate the dashboard."
+            "No beds are configured yet. Add one from the Bed Roster tab "
+            "in Manage Beds & Patients below to populate the dashboard."
         )
-        return
 
     resolution = resolve_active_admissions(admissions_df)
     invalid_beds = find_invalid_bed_assignments(resolution.resolved)
@@ -263,118 +255,6 @@ def _admission_date_bounds(admissions_df: pd.DataFrame) -> tuple[dt.date, dt.dat
         return today - dt.timedelta(days=30), today
     dates = admissions_df["admission_time"].dt.date
     return dates.min(), max(dates.max(), dt.date.today())
-
-
-def _render_data_source_section() -> None:
-    with st.expander("\U0001F4E5  Import / manage admissions data", expanded=False):
-        st.caption(
-            "Upload a CSV with columns: patient_id, ward, bed_id, admission_time, "
-            "discharge_time, status, planned_discharge_date. Uploading replaces the "
-            "current dataset after validation. Try `data/sample_admissions.csv` for a "
-            "clean example, or `data/sample_admissions_with_errors.csv` to see how "
-            "validation errors are reported."
-        )
-        uploaded = st.file_uploader("Admissions CSV", type=["csv"], key="admissions_uploader")
-
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            import_clicked = st.button(
-                "Validate & replace dataset", disabled=uploaded is None, width="stretch"
-            )
-        with col_b:
-            reset_clicked = st.button("Reset to sample data", width="stretch")
-
-        if reset_clicked:
-            with session_scope() as session:
-                seed_database(session, reset=True)
-            st.session_state.pop("last_import_report", None)
-            st.success("Dataset reset to the built-in sample data.")
-            st.rerun()
-
-        if import_clicked and uploaded is not None:
-            _handle_upload(uploaded)
-
-        report = st.session_state.get("last_import_report")
-        if report is not None:
-            _render_import_report(report)
-
-
-def _handle_upload(uploaded) -> None:
-    try:
-        raw_bytes = uploaded.getvalue()
-        df = pd.read_csv(io.BytesIO(raw_bytes))
-    except Exception:
-        st.error(
-            "Could not read this file as CSV. Please check the file format and try again."
-        )
-        return
-
-    report = validate_admissions_csv(df)
-
-    if not report.is_usable:
-        st.session_state["last_import_report"] = {
-            "column_errors": report.column_errors,
-            "rejected": [],
-            "warnings": [],
-            "accepted": 0,
-            "total": 0,
-            "new_wards": [],
-        }
-        st.rerun()
-        return
-
-    if report.valid_rows.empty:
-        st.session_state["last_import_report"] = {
-            "column_errors": [],
-            "rejected": [_issue_to_dict(i) for i in report.rejected_rows],
-            "warnings": [_issue_to_dict(i) for i in report.warnings],
-            "accepted": 0,
-            "total": report.total_rows_seen,
-            "new_wards": [],
-        }
-        st.rerun()
-        return
-
-    with session_scope() as session:
-        reset_all_data(session)
-        new_wards = persist_admissions(session, report.valid_rows)
-
-    st.session_state["last_import_report"] = {
-        "column_errors": [],
-        "rejected": [_issue_to_dict(i) for i in report.rejected_rows],
-        "warnings": [_issue_to_dict(i) for i in report.warnings],
-        "accepted": len(report.valid_rows),
-        "total": report.total_rows_seen,
-        "new_wards": new_wards,
-    }
-    st.rerun()
-
-
-def _issue_to_dict(issue: RowIssue) -> dict:
-    return {"row_number": issue.row_number, "patient_id": issue.patient_id, "reason": issue.reason}
-
-
-def _render_import_report(report: dict) -> None:
-    if report["column_errors"]:
-        for err in report["column_errors"]:
-            st.error(err)
-        return
-
-    if report["accepted"]:
-        st.success(f"Imported {report['accepted']} of {report['total']} row(s) successfully.")
-    elif report["total"]:
-        st.error(f"None of the {report['total']} row(s) passed validation -- see details below.")
-
-    if report["new_wards"]:
-        st.info("New ward(s) created automatically: " + ", ".join(report["new_wards"]))
-
-    if report["rejected"]:
-        with st.expander(f"{len(report['rejected'])} row(s) rejected", expanded=True):
-            st.dataframe(pd.DataFrame(report["rejected"]), width="stretch", hide_index=True)
-
-    if report["warnings"]:
-        with st.expander(f"{len(report['warnings'])} warning(s)", expanded=False):
-            st.dataframe(pd.DataFrame(report["warnings"]), width="stretch", hide_index=True)
 
 
 # ============================================================================

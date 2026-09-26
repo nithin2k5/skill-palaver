@@ -1,8 +1,0 @@
-patient_id,ward,bed_id,admission_time,discharge_time,status,planned_discharge_date
-P101,ICU-A,A01,2026-09-24 08:00:00,,Occupied,2026-09-27
-,ICU-A,A02,2026-09-24 09:00:00,,Occupied,
-P103,,A03,2026-09-24 09:30:00,,Occupied,
-P104,ICU-A,,2026-09-24 10:00:00,,Occupied,
-P105,ICU-A,A05,not-a-date,,Occupied,
-P106,ICU-A,A06,2026-09-24 11:00:00,,Pending,
-P107,ICU-D,D01,2026-09-24 12:00:00,,Occupied,2026-09-28
