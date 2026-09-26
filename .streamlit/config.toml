@@ -5,10 +5,17 @@ toolbarMode = "viewer"
 [theme]
 base = "light"
 primaryColor = "#1d4ed8"
-backgroundColor = "#fbfbfc"
+backgroundColor = "#f4f5f7"
 secondaryBackgroundColor = "#ffffff"
 textColor = "#0f1e3d"
 font = "sans serif"
+headingFont = "sans serif"
+codeFont = "monospace"
+linkColor = "#1d4ed8"
+borderColor = "#dde2e9"
+baseRadius = "small"
+buttonRadius = "small"
+showWidgetBorder = true
 
 [browser]
 gatherUsageStats = false

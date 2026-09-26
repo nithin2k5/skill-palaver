@@ -35,7 +35,8 @@ from services.transfers import find_invalid_bed_assignments, resolve_active_admi
 from ui.components import (
     render_bed_legend,
     render_callout,
-    render_data_quality_card,
+    render_data_quality_grid,
+    render_footnote,
     render_header,
     render_metric_row,
     render_section_title,
@@ -48,6 +49,33 @@ PROJECT_TITLE = "ICU Bed Occupancy Dashboard"
 PROJECT_DOMAIN = "HOSPITAL ADMINISTRATION"
 
 ALL_WARDS_LABEL = "All Wards"
+
+# Shared Plotly theming so every chart reads as part of the same system
+# instead of using Plotly's stock look. Applied on top of each figure's
+# own colors/data rather than baked into a registered template, so it
+# stays simple to reason about per chart.
+CHART_FONT = dict(family="IBM Plex Sans, Inter, sans-serif", color="#33415c", size=12)
+CHART_GRID_COLOR = "#e5e8ed"
+COLOR_OCCUPIED = "#c81e2c"
+COLOR_FREE = "#1d4ed8"
+COLOR_AMBER = "#b5790a"
+
+
+def _apply_chart_theme(fig, *, height: int = 320, showlegend: bool | None = None) -> None:
+    fig.update_layout(
+        font=CHART_FONT,
+        title_font=dict(family="IBM Plex Sans, Inter, sans-serif", color="#0f1e3d", size=15),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=44, l=8, r=8, b=8),
+        height=height,
+        legend_title_text="",
+        hoverlabel=dict(bgcolor="#0f1e3d", font_color="white", font_family="IBM Plex Mono, monospace"),
+    )
+    if showlegend is not None:
+        fig.update_layout(showlegend=showlegend)
+    fig.update_xaxes(showgrid=False, linecolor=CHART_GRID_COLOR, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=CHART_GRID_COLOR, zeroline=False)
 
 
 def _ensure_data_loaded() -> None:
@@ -64,7 +92,10 @@ def _ensure_data_loaded() -> None:
 
 
 def render() -> None:
-    st.markdown(CSS, unsafe_allow_html=True)
+    # st.html (not st.markdown) -- see ui/components.py module docstring
+    # for why: markdown's CommonMark parser breaks a multi-line CSS block
+    # at the first blank line.
+    st.html(CSS)
     _ensure_data_loaded()
 
     with session_scope() as session:
@@ -98,21 +129,24 @@ def render() -> None:
 
     # ---------------------------------------------------------------- Filters
     ward_options = [ALL_WARDS_LABEL] + sorted(wards_df["name"].tolist())
-    render_section_title("Filters", "Ward scopes every metric, chart and table below.")
-    f_col1, f_col2, f_col3 = st.columns([1.2, 1, 1.6])
-    with f_col1:
-        selected_ward = st.selectbox("Ward", ward_options, key="filter_ward")
-    with f_col2:
-        bed_status_filter = st.selectbox("Bed status (live board)", ["All", "Occupied", "Free"], key="filter_bed_status")
-    with f_col3:
-        min_date, max_date = _admission_date_bounds(admissions_df)
-        date_range = st.date_input(
-            "Admission date range (patient table)",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date,
-            key="filter_date_range",
-        )
+    render_section_title("01", "Filters", "Ward scopes every metric, chart and table below.")
+    with st.container(border=True):
+        f_col1, f_col2, f_col3 = st.columns([1.2, 1, 1.6])
+        with f_col1:
+            selected_ward = st.selectbox("Ward", ward_options, key="filter_ward")
+        with f_col2:
+            bed_status_filter = st.selectbox(
+                "Bed status (live board)", ["All", "Occupied", "Free"], key="filter_bed_status"
+            )
+        with f_col3:
+            min_date, max_date = _admission_date_bounds(admissions_df)
+            date_range = st.date_input(
+                "Admission date range (patient table)",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+                key="filter_date_range",
+            )
 
     ward_filtered_beds = beds_df if selected_ward == ALL_WARDS_LABEL else beds_df[beds_df["ward"] == selected_ward]
     ward_filtered_resolved = (
@@ -122,7 +156,7 @@ def render() -> None:
     )
 
     # ---------------------------------------------------------------- Metrics
-    render_section_title("Summary Metrics")
+    render_section_title("02", "Summary Metrics")
     occ = compute_occupancy(ward_filtered_beds, ward_filtered_resolved)
     today = dt.date.today()
     forecast = forecast_free_beds_tomorrow(
@@ -138,51 +172,64 @@ def render() -> None:
     )
     render_metric_row(
         [
-            ("Total ICU Beds", occ.total_beds, ""),
-            ("Occupied Beds", occ.occupied_beds, "red"),
-            ("Free Beds", occ.free_beds, "blue"),
-            ("Occupancy %", f"{occ.occupancy_pct}%", "red" if occ.occupancy_pct >= 85 else ""),
-            ("Planned Discharges", planned_total, "amber"),
-            ("Forecast Free Tomorrow", forecast.forecast_free_tomorrow, "blue"),
+            ("Total ICU Beds", occ.total_beds, "beds", ""),
+            ("Occupied Beds", occ.occupied_beds, "beds", "red"),
+            ("Free Beds", occ.free_beds, "beds", "blue"),
+            ("Occupancy", f"{occ.occupancy_pct}", "%", "red" if occ.occupancy_pct >= 85 else ""),
+            ("Planned Discharges", planned_total, "patients", "amber"),
+            ("Forecast Free Tomorrow", forecast.forecast_free_tomorrow, "beds", "blue"),
         ]
     )
 
     # ---------------------------------------------------------- Live bed board
-    render_section_title("Live Bed Status", "Red = occupied · amber dot = discharge planned · white = free")
-    render_bed_legend()
-    board = bed_status_board(ward_filtered_beds, ward_filtered_resolved)
-    if bed_status_filter != "All":
-        board = board[board["status"] == bed_status_filter]
-    if board.empty:
-        render_callout("No beds match the current filters.")
-    else:
-        for ward_name, ward_group in board.groupby("ward", sort=True):
-            render_ward_bed_grid(ward_name, ward_group)
+    render_section_title(
+        "03", "Live Bed Status", "Red = occupied · amber dot = discharge planned · hover a bed for details"
+    )
+    with st.container(border=True):
+        render_bed_legend()
+        board = bed_status_board(ward_filtered_beds, ward_filtered_resolved)
+        if bed_status_filter != "All":
+            board = board[board["status"] == bed_status_filter]
+        if board.empty:
+            render_callout("No beds match the current filters.")
+        else:
+            for ward_name, ward_group in board.groupby("ward", sort=True):
+                render_ward_bed_grid(ward_name, ward_group)
 
     # ------------------------------------------------------------------ Charts
-    render_section_title("Charts")
-    _render_charts(beds_df, resolution.resolved, admissions_df, selected_ward)
+    render_section_title("04", "Charts")
+    with st.container(border=True):
+        _render_charts(beds_df, resolution.resolved, admissions_df, selected_ward)
 
     # --------------------------------------------------------- Next-day forecast
-    render_section_title("Next-Day Forecast", "forecast = min(total beds, currently free + planned discharges tomorrow)")
+    render_section_title(
+        "05", "Next-Day Forecast", "forecast = min(total beds, currently free + planned discharges tomorrow)"
+    )
     render_metric_row(
         [
-            ("Currently Free", occ.free_beds, ""),
-            ("Planned Discharges Tomorrow", forecast.planned_discharges_tomorrow, "amber"),
-            ("Forecast Free Tomorrow", forecast.forecast_free_tomorrow, "blue"),
+            ("Currently Free", occ.free_beds, "beds", ""),
+            ("Planned Discharges Tomorrow", forecast.planned_discharges_tomorrow, "patients", "amber"),
+            ("Forecast Free Tomorrow", forecast.forecast_free_tomorrow, "beds", "blue"),
         ]
     )
 
     # ------------------------------------------------------------- Data quality
     render_section_title(
+        "06",
         "Data Quality",
         "Issues detected in the underlying admissions data (ward filter does not apply -- these are dataset-wide).",
     )
     _render_data_quality(admissions_df, resolution.duplicates, resolution.transfers, invalid_beds)
 
     # --------------------------------------------------------- Admissions table
-    render_section_title("Admissions / Patient Table", "Underlying records, one row per admission (all statuses).")
-    _render_admissions_table(admissions_df, selected_ward, date_range)
+    render_section_title("07", "Admissions / Patient Table", "Underlying records, one row per admission (all statuses).")
+    with st.container(border=True):
+        _render_admissions_table(admissions_df, selected_ward, date_range)
+
+    render_footnote(
+        "Prototype -- not for clinical use. Real patient data requires access control, "
+        "encryption, auditing and a compliance review before production deployment."
+    )
 
 
 def _admission_date_bounds(admissions_df: pd.DataFrame) -> tuple[dt.date, dt.date]:
@@ -194,7 +241,7 @@ def _admission_date_bounds(admissions_df: pd.DataFrame) -> tuple[dt.date, dt.dat
 
 
 def _render_data_source_section() -> None:
-    with st.expander("Import / manage admissions data", expanded=False):
+    with st.expander("\U0001F4E5  Import / manage admissions data", expanded=False):
         st.caption(
             "Upload a CSV with columns: patient_id, ward, bed_id, admission_time, "
             "discharge_time, status, planned_discharge_date. Uploading replaces the "
@@ -206,7 +253,9 @@ def _render_data_source_section() -> None:
 
         col_a, col_b = st.columns([1, 1])
         with col_a:
-            import_clicked = st.button("Validate & replace dataset", disabled=uploaded is None, width="stretch")
+            import_clicked = st.button(
+                "Validate & replace dataset", disabled=uploaded is None, width="stretch"
+            )
         with col_b:
             reset_clicked = st.button("Reset to sample data", width="stretch")
 
@@ -304,13 +353,13 @@ def _render_import_report(report: dict) -> None:
 
 
 def _render_charts(beds_df: pd.DataFrame, resolved: pd.DataFrame, admissions_df: pd.DataFrame, selected_ward: str) -> None:
-    color_map = {"Occupied": "#c81e2c", "Free": "#1d4ed8"}
+    color_map = {"Occupied": COLOR_OCCUPIED, "Free": COLOR_FREE}
 
     chart_col1, chart_col2 = st.columns(2)
+    occupied_ids: set = set(resolved["bed_id"].unique()) if not resolved.empty else set()
 
     with chart_col1:
         by_ward = beds_df.groupby("ward")["id"].count().rename("Total").reset_index()
-        occupied_ids = set(resolved["bed_id"].unique()) if not resolved.empty else set()
         occ_by_ward = beds_df.assign(is_occupied=beds_df["id"].isin(occupied_ids)).groupby("ward")["is_occupied"].sum()
         by_ward["Occupied"] = by_ward["ward"].map(occ_by_ward).fillna(0).astype(int)
         by_ward["Free"] = by_ward["Total"] - by_ward["Occupied"]
@@ -319,19 +368,29 @@ def _render_charts(beds_df: pd.DataFrame, resolved: pd.DataFrame, admissions_df:
             melted, x="ward", y="Beds", color="Status", barmode="stack",
             color_discrete_map=color_map, title="ICU Occupancy by Ward",
         )
-        fig.update_layout(margin=dict(t=40, l=10, r=10, b=10), height=320, legend_title_text="")
+        fig.update_traces(marker_line_width=0)
+        fig.update_layout(xaxis_title="", yaxis_title="Beds")
+        _apply_chart_theme(fig)
         st.plotly_chart(fig, width="stretch")
 
     with chart_col2:
         total_beds = len(beds_df) if selected_ward == "All Wards" else len(beds_df[beds_df["ward"] == selected_ward])
-        occupied = len(occupied_ids & set(beds_df[beds_df["ward"] == selected_ward]["id"])) if selected_ward != "All Wards" else len(occupied_ids)
+        occupied = (
+            len(occupied_ids & set(beds_df[beds_df["ward"] == selected_ward]["id"]))
+            if selected_ward != "All Wards"
+            else len(occupied_ids)
+        )
         free = max(total_beds - occupied, 0)
         pie_df = pd.DataFrame({"Status": ["Occupied", "Free"], "Beds": [occupied, free]})
         fig2 = go.Figure(
-            data=[go.Pie(labels=pie_df["Status"], values=pie_df["Beds"], hole=0.55,
-                         marker_colors=[color_map["Occupied"], color_map["Free"]])]
+            data=[go.Pie(
+                labels=pie_df["Status"], values=pie_df["Beds"], hole=0.6,
+                marker=dict(colors=[color_map["Occupied"], color_map["Free"]], line=dict(color="#ffffff", width=2)),
+                textinfo="value+percent",
+            )]
         )
-        fig2.update_layout(title="Occupied vs Free (current filter)", margin=dict(t=40, l=10, r=10, b=10), height=320)
+        fig2.update_layout(title="Occupied vs Free (current filter)")
+        _apply_chart_theme(fig2, showlegend=True)
         st.plotly_chart(fig2, width="stretch")
 
     chart_col3, chart_col4 = st.columns(2)
@@ -345,8 +404,9 @@ def _render_charts(beds_df: pd.DataFrame, resolved: pd.DataFrame, admissions_df:
             counts.columns = ["Planned Discharge Date", "Patients"]
             counts = counts.sort_values("Planned Discharge Date")
             fig3 = px.bar(counts, x="Planned Discharge Date", y="Patients", title="Planned Discharges by Date")
-            fig3.update_traces(marker_color="#c8860d")
-            fig3.update_layout(margin=dict(t=40, l=10, r=10, b=10), height=320)
+            fig3.update_traces(marker_color=COLOR_AMBER, marker_line_width=0)
+            fig3.update_layout(xaxis_title="", yaxis_title="Patients")
+            _apply_chart_theme(fig3)
             st.plotly_chart(fig3, width="stretch")
 
     with chart_col4:
@@ -357,12 +417,21 @@ def _render_charts(beds_df: pd.DataFrame, resolved: pd.DataFrame, admissions_df:
             trend = discharged.groupby("operational_discharge_date").size().reset_index(name="Discharges")
             trend.columns = ["Operational Discharge Date", "Discharges"]
             trend = trend.sort_values("Operational Discharge Date").tail(14)
+            # Format as a label string rather than a raw date: with only a
+            # handful of sparse points, Plotly's continuous date axis
+            # infers a sub-day tick scale (00:00, 06:00, ...) which reads
+            # as noise. A categorical string axis keeps one tick per day.
+            trend["Operational Discharge Date"] = trend["Operational Discharge Date"].apply(
+                lambda d: pd.Timestamp(d).strftime("%d %b")
+            )
             fig4 = px.line(
                 trend, x="Operational Discharge Date", y="Discharges", markers=True,
                 title="Discharges per Operational Day (last 14)",
             )
-            fig4.update_traces(line_color="#1d4ed8")
-            fig4.update_layout(margin=dict(t=40, l=10, r=10, b=10), height=320)
+            fig4.update_traces(line_color=COLOR_FREE, marker=dict(size=7, color=COLOR_FREE))
+            fig4.update_layout(xaxis_title="", yaxis_title="Discharges")
+            fig4.update_yaxes(dtick=1)
+            _apply_chart_theme(fig4)
             st.plotly_chart(fig4, width="stretch")
 
 
@@ -379,47 +448,46 @@ def _render_data_quality(
         admissions=admissions_df,
     )
 
-    dq_col1, dq_col2, dq_col3, dq_col4 = st.columns(4)
-    with dq_col1:
-        render_data_quality_card(
-            "Duplicate Active Records",
-            report.duplicate_active_count,
-            "Patients with more than one 'Occupied' record, resolved to their latest bed.",
-        )
-    with dq_col2:
-        render_data_quality_card(
-            "Transfers Detected",
-            report.transfers_detected_count,
-            "Ward/bed moves reconstructed from the admissions data.",
-        )
-    with dq_col3:
-        render_data_quality_card(
-            "Invalid Bed Assignments",
-            report.invalid_bed_assignment_count,
-            "Beds currently claimed by more than one patient.",
-        )
-    with dq_col4:
-        render_data_quality_card(
-            "Early-Morning Discharges",
-            report.early_morning_discharge_count,
-            f"Discharges logged before {settings.operational_day_cutoff_hour:02d}:00 -- review for after-midnight logging.",
+    with st.container(border=True):
+        render_data_quality_grid(
+            [
+                (
+                    "Duplicate Active Records",
+                    report.duplicate_active_count,
+                    "Patients with more than one 'Occupied' record, resolved to their latest bed.",
+                ),
+                (
+                    "Transfers Detected",
+                    report.transfers_detected_count,
+                    "Ward/bed moves reconstructed from the admissions data.",
+                ),
+                (
+                    "Invalid Bed Assignments",
+                    report.invalid_bed_assignment_count,
+                    "Beds currently claimed by more than one patient.",
+                ),
+                (
+                    "Early-Morning Discharges",
+                    report.early_morning_discharge_count,
+                    f"Discharges logged before {settings.operational_day_cutoff_hour:02d}:00 -- review for after-midnight logging.",
+                ),
+            ]
         )
 
-    with st.expander("Inspect flagged records", expanded=False):
-        tabs = st.tabs(["Duplicate records", "Transfers", "Invalid bed assignments", "Early-morning discharges"])
-        with tabs[0]:
-            _dataframe_or_empty(report.duplicates, "No duplicate active records detected.")
-        with tabs[1]:
-            _dataframe_or_empty(report.transfers, "No transfers detected.")
-        with tabs[2]:
-            _dataframe_or_empty(report.invalid_beds, "No invalid bed assignments detected.")
-        with tabs[3]:
-            _dataframe_or_empty(
-                report.early_morning_discharges[
-                    ["patient_identifier", "ward", "bed_number", "discharge_time", "operational_discharge_date"]
-                ] if not report.early_morning_discharges.empty else report.early_morning_discharges,
-                "No early-morning discharges detected.",
-            )
+        with st.expander("Inspect flagged records", expanded=False):
+            tabs = st.tabs(["Duplicate records", "Transfers", "Invalid bed assignments", "Early-morning discharges"])
+            with tabs[0]:
+                _dataframe_or_empty(report.duplicates, "No duplicate active records detected.")
+            with tabs[1]:
+                _dataframe_or_empty(report.transfers, "No transfers detected.")
+            with tabs[2]:
+                _dataframe_or_empty(report.invalid_beds, "No invalid bed assignments detected.")
+            with tabs[3]:
+                cols = ["patient_identifier", "ward", "bed_number", "discharge_time", "operational_discharge_date"]
+                _dataframe_or_empty(
+                    report.early_morning_discharges[cols] if not report.early_morning_discharges.empty else report.early_morning_discharges,
+                    "No early-morning discharges detected.",
+                )
 
 
 def _dataframe_or_empty(df: pd.DataFrame, empty_message: str) -> None:
@@ -458,6 +526,15 @@ def _render_admissions_table(admissions_df: pd.DataFrame, selected_ward: str, da
         "planned_discharge_date",
     ]
     table = table[display_cols].sort_values("admission_time", ascending=False)
+    # Format for display only -- the underlying data/table object used
+    # elsewhere is never touched, only this render-time copy.
+    table["admission_time"] = table["admission_time"].dt.strftime("%d %b %Y, %H:%M")
+    table["discharge_time"] = table["discharge_time"].apply(
+        lambda v: "—" if pd.isna(v) else pd.Timestamp(v).strftime("%d %b %Y, %H:%M")
+    )
+    table["planned_discharge_date"] = table["planned_discharge_date"].apply(
+        lambda v: "—" if pd.isna(v) else pd.Timestamp(v).strftime("%d %b %Y")
+    )
     table = table.rename(
         columns={
             "patient_identifier": "Patient ID",
