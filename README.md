@@ -72,6 +72,41 @@ first run the app automatically seeds a realistic sample dataset (3
 wards, 17 beds, 13 patients) so there is something to look at
 immediately -- see "Sample data" below for exactly what it contains.
 
+## Using Neon (managed Postgres)
+
+The app runs on SQLite with zero setup, but the whole point of reading
+`DATABASE_URL` from the environment (`config.py`) is that switching
+backends never touches application code. To point it at
+[Neon](https://neon.tech):
+
+1. Create a Neon project (or a new database inside an existing one) from
+   the Neon console. Free tier is plenty for this app.
+2. In the project's **Dashboard > Connect** panel, copy the *pooled*
+   connection string (Neon fronts Postgres with PgBouncer for exactly
+   this kind of short-lived-connection app; use the direct one only if
+   you specifically need a session-level feature the pooler doesn't
+   support, which this app doesn't).
+3. Put it in your `.env` as `DATABASE_URL`, with the SQLAlchemy driver
+   prefix and `sslmode=require` (Neon requires TLS):
+   ```
+   DATABASE_URL=postgresql+psycopg2://<user>:<password>@<endpoint>.neon.tech/<dbname>?sslmode=require
+   ```
+4. Run the app normally (`streamlit run app.py`). `init_db()` creates the
+   schema on first connect via `Base.metadata.create_all()` -- there's no
+   separate migration step to run for a fresh database.
+
+Nothing else changes: the same SQLAlchemy models, the same
+`services/*`/`database/repository.py` code path, and the same seeded
+sample data on first run (now persisted in Neon instead of a local
+file). `psycopg2-binary` (in `requirements.txt`) is the Postgres driver;
+`database/database.py` also sets `pool_pre_ping=True` for any non-SQLite
+URL, so a connection Neon has silently closed after idling gets
+transparently replaced instead of surfacing as a query error.
+
+Never commit a real `DATABASE_URL` -- it contains a password. `.env` is
+already git-ignored; keep the connection string there or in your
+deployment platform's secret store, never in code.
+
 ## Running the tests
 
 ```bash
@@ -90,11 +125,11 @@ history, transfer time before admission time, and so on).
 
 ## How it works
 
-1. **Data lives in SQLite** (`icu_dashboard.db`, git-ignored), accessed
-   only through SQLAlchemy models (`database/models.py`) and a small
-   read-oriented repository (`database/repository.py`). Switching to
-   PostgreSQL later is a one-line change: set `DATABASE_URL` in `.env`
-   to a `postgresql+psycopg2://...` URL.
+1. **Data lives in SQLite by default** (`icu_dashboard.db`, git-ignored),
+   accessed only through SQLAlchemy models (`database/models.py`) and a
+   small read-oriented repository (`database/repository.py`). Pointing it
+   at a managed Postgres instead -- Neon included -- is a one-line change:
+   set `DATABASE_URL` in `.env`. See "Using Neon" below.
 2. **Every admissions row -- sample or uploaded -- goes through the same
    pipeline**: `services/ingestion.py` validates the CSV (required
    columns, required fields, parseable dates, valid status values) and

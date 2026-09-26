@@ -3,8 +3,8 @@ Database engine/session setup.
 
 All DB access goes through ``get_session()`` / ``session_scope()`` defined
 here. Nothing outside this module (and models.py) should import
-SQLAlchemy's ``create_engine`` directly -- this keeps a future move from
-SQLite to PostgreSQL to a one-line change of ``DATABASE_URL``.
+SQLAlchemy's ``create_engine`` directly -- this keeps moving from SQLite
+to a managed Postgres (e.g. Neon) a one-line change of ``DATABASE_URL``.
 """
 from __future__ import annotations
 
@@ -18,9 +18,19 @@ from sqlalchemy.orm import Session, sessionmaker
 from config import settings
 from database.models import Base
 
-_connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+_is_sqlite = settings.database_url.startswith("sqlite")
+_connect_args = {"check_same_thread": False} if _is_sqlite else {}
 
-engine: Engine = create_engine(settings.database_url, connect_args=_connect_args, future=True)
+# pool_pre_ping guards against a serverless/managed Postgres provider
+# (Neon included) closing an idle connection server-side -- without it,
+# the first query on a connection that went stale would fail outright
+# instead of transparently reconnecting. It's a no-op for SQLite.
+engine: Engine = create_engine(
+    settings.database_url,
+    connect_args=_connect_args,
+    pool_pre_ping=not _is_sqlite,
+    future=True,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
