@@ -63,10 +63,28 @@ cp .env.example .env              # optional -- defaults already work locally
 streamlit run app.py
 ```
 
-Open the URL Streamlit prints (typically http://localhost:8501). On
-first run the app automatically seeds a realistic sample dataset (3
-wards, 17 beds, 13 patients) so there is something to look at
-immediately -- see "Sample data" below for exactly what it contains.
+Open the URL Streamlit prints (typically http://localhost:8501).
+
+**The dashboard starts empty and never invents data.** A fresh database
+has no wards, beds or patients, and every metric reads zero until you
+enter real records. To get going, open **Manage Beds & Patients**:
+
+1. **Bed Roster** tab -> type a ward name (e.g. `ICU-A`) and a bed number
+   (e.g. `A01`) and add it. Repeat for each bed in the ward. The ward is
+   created automatically the first time you name it.
+2. **Admit Patient** tab -> pick the ward and a free bed, enter the
+   patient identifier, admission time, and (optionally) a planned
+   discharge date.
+3. Discharge, transfer, or take beds out of service from the same panel
+   as things change.
+
+Every metric tile, the live bed board, all four charts, the data-quality
+counts and the admissions table are computed from exactly those records
+-- nothing on the page is placeholder or illustrative.
+
+If you want a populated dashboard for a demo or for local development,
+set `ICU_RESEED_ON_START=true` (see "Demo dataset" below). It wipes the
+database first, so never use it against real records.
 
 ## Using Neon (managed Postgres)
 
@@ -91,10 +109,10 @@ backends never touches application code. To point it at
    schema on first connect via `Base.metadata.create_all()` -- there's no
    separate migration step to run for a fresh database.
 
-Nothing else changes: the same SQLAlchemy models, the same
-`services/*`/`database/repository.py` code path, and the same seeded
-sample data on first run (now persisted in Neon instead of a local
-file). `psycopg2-binary` (in `requirements.txt`) is the Postgres driver;
+Nothing else changes: the same SQLAlchemy models and the same
+`services/*`/`database/repository.py` code path, with records now
+persisted in Neon instead of a local file.
+`psycopg2-binary` (in `requirements.txt`) is the Postgres driver;
 `database/database.py` also sets `pool_pre_ping=True` for any non-SQLite
 URL, so a connection Neon has silently closed after idling gets
 transparently replaced instead of surfacing as a query error.
@@ -126,16 +144,15 @@ history, transfer time before admission time, and so on).
    small read-oriented repository (`database/repository.py`). Pointing it
    at a managed Postgres instead -- Neon included -- is a one-line change:
    set `DATABASE_URL` in `.env`. See "Using Neon" below.
-2. **The sample dataset goes through a real validation pipeline, not a
-   direct insert**: `database/seed.py` builds the admissions rows and
-   pushes them through `services/ingestion.py` (required columns,
-   required fields, parseable dates, valid status values) exactly as an
-   uploaded sheet would have been validated, then `persist_admissions`
-   writes the valid rows, auto-creating any new ward/bed/patient it
-   encounters. There is no live upload UI -- day-to-day changes go
-   through **Manage Beds & Patients** (admit/discharge/transfer, bed
-   roster) instead, which is dataset-wide and doesn't require replacing
-   the whole dataset for a single change.
+2. **Nothing is generated at runtime.** The app never writes a record the
+   operator didn't ask for: it starts empty and every row comes from
+   **Manage Beds & Patients** (add a ward/bed, admit, discharge,
+   transfer, take a bed out of service), each validated in
+   `services/bed_management.py` first. The only writer that invents rows
+   is `database/seed.py`, and it runs solely behind the explicit
+   `ICU_RESEED_ON_START` flag (off by default) -- it pushes its rows
+   through `services/ingestion.py` validation rather than inserting them
+   directly, so even the demo data has to satisfy the documented schema.
 3. **The UI (`ui/dashboard.py`) never talks to the database or does
    business math directly** -- it loads DataFrames from the repository,
    passes them through `services/*`, and hands the results to
@@ -246,11 +263,37 @@ Every action validates in `services/bed_management.py` before touching
 the database and raises a `BedManagementError` with a plain-English
 message on failure -- shown via `st.error`, never a stack trace.
 
-## Sample data
+## Charts
+
+All four charts are computed from live database queries -- there are no
+hardcoded series, sample arrays or generated values anywhere in
+`_render_charts`:
+
+| Chart | Source |
+|---|---|
+| ICU Occupancy by Ward | every bed in the roster, classified Occupied / Free / Out of Service |
+| Bed availability | the same classification, aggregated for the current ward filter |
+| Planned Discharges by Date | `planned_discharge_date` on currently-occupied (post duplicate-resolution) admissions |
+| Discharges per Operational Day | real discharge timestamps, grouped by *operational* date (see "Midnight-discharge handling") |
+
+Two consistency rules they follow, which are easy to get wrong:
+out-of-service beds are their own category rather than being folded into
+"Free" (so a chart can never disagree with the Free Beds tile), and the
+ward filter scopes the charts exactly as it scopes the metrics and
+tables. On an empty database each chart renders an explanatory empty
+state instead of blank axes.
+
+## Demo dataset (opt-in)
+
+The app does not load this, or anything else, on its own -- a fresh
+database stays empty. Set `ICU_RESEED_ON_START=true` to replace the
+database contents with it for a demo or for local development (it wipes
+what is there first, so never use it against real records).
 
 `database/seed.py` generates dates **relative to the day the app is
 run**, so the forecast is always meaningful. It deliberately covers every
-scenario the dashboard is built to handle:
+scenario the dashboard is built to handle, which makes it useful for
+exercising the edge cases without hand-entering them:
 
 | Scenario | Patient(s) |
 |---|---|

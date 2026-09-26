@@ -19,7 +19,6 @@ import streamlit as st
 from config import settings
 from database.database import session_scope
 from database.repository import (
-    has_any_admissions,
     load_admissions,
     load_beds,
     load_wards,
@@ -36,7 +35,7 @@ from services.bed_management import (
 )
 from services.data_quality import annotate_discharges, build_data_quality_report
 from services.forecasting import forecast_free_beds_tomorrow
-from services.occupancy import bed_status_board, compute_occupancy
+from services.occupancy import OUT_OF_SERVICE, bed_status_board, compute_occupancy
 from services.transfers import find_invalid_bed_assignments, resolve_active_admissions
 from ui.components import (
     render_bed_legend,
@@ -65,6 +64,7 @@ CHART_GRID_COLOR = "#e5e8ed"
 COLOR_OCCUPIED = "#c81e2c"
 COLOR_FREE = "#1d4ed8"
 COLOR_AMBER = "#b5790a"
+COLOR_OOS = "#9aa3b0"
 
 
 def _apply_chart_theme(fig, *, height: int = 320, showlegend: bool | None = None) -> None:
@@ -85,16 +85,23 @@ def _apply_chart_theme(fig, *, height: int = 320, showlegend: bool | None = None
 
 
 def _ensure_data_loaded() -> None:
-    """Seed the database with sample data on first run.
+    """Optionally load demo data -- off by default.
 
-    Only runs when the admissions table is genuinely empty, so a
-    real/uploaded dataset is never overwritten on a page refresh -- unless
-    the operator has explicitly set ICU_RESEED_ON_START=true (useful for
-    demos), which re-seeds on every process start.
+    The dashboard does **not** invent data. A fresh database stays empty
+    until real wards, beds and admissions are entered through the Manage
+    Beds & Patients panel, so every figure on the page reflects something
+    an administrator actually recorded.
+
+    The one exception is explicit and opt-in: setting
+    ``ICU_RESEED_ON_START=true`` (see .env.example) replaces the contents
+    with the synthetic demo dataset in database/seed.py. That is for
+    demos and local development only -- never point it at a database
+    holding real records, since it wipes what is there first.
     """
+    if not settings.reseed_on_start:
+        return
     with session_scope() as session:
-        if settings.reseed_on_start or not has_any_admissions(session):
-            seed_database(session, reset=True)
+        seed_database(session, reset=True)
 
 
 def render() -> None:
@@ -116,13 +123,15 @@ def render() -> None:
     render_header(PROJECT_ID, PROJECT_TITLE, PROJECT_DOMAIN, stats_line)
 
     if beds_df.empty:
-        # Not a hard stop -- every section below already tolerates empty
-        # data, and Manage Beds & Patients (which still renders) is the
-        # only way to add a bed back now that there is no CSV import to
-        # fall back on.
+        # The expected state of a brand-new database: the dashboard never
+        # invents data. Not a hard stop -- every section below tolerates
+        # empty data, and Manage Beds & Patients (which still renders) is
+        # where the first ward and bed get created.
         render_callout(
-            "No beds are configured yet. Add one from the Bed Roster tab "
-            "in Manage Beds & Patients below to populate the dashboard."
+            "This database is empty. Open Manage Beds & Patients below and use the "
+            "Bed Roster tab to create your first ward and beds, then admit patients "
+            "from the Admit Patient tab. Every metric and chart on this page is "
+            "computed from those records."
         )
 
     resolution = resolve_active_admissions(admissions_df)
@@ -156,6 +165,11 @@ def render() -> None:
         resolution.resolved
         if selected_ward == ALL_WARDS_LABEL
         else resolution.resolved[resolution.resolved["ward"] == selected_ward]
+    )
+    ward_filtered_admissions = (
+        admissions_df
+        if selected_ward == ALL_WARDS_LABEL or admissions_df.empty
+        else admissions_df[admissions_df["ward"] == selected_ward]
     )
 
     # ---------------------------------------------------------------- Metrics
@@ -216,7 +230,7 @@ def render() -> None:
     # ------------------------------------------------------------------ Charts
     render_section_title("05", "Charts")
     with st.container(border=True):
-        _render_charts(beds_df, resolution.resolved, admissions_df, selected_ward)
+        _render_charts(ward_filtered_beds, ward_filtered_resolved, ward_filtered_admissions)
 
     # --------------------------------------------------------- Next-day forecast
     render_section_title(
@@ -496,46 +510,64 @@ def _render_bed_roster_tab(
                     st.error(str(e))
 
 
-def _render_charts(beds_df: pd.DataFrame, resolved: pd.DataFrame, admissions_df: pd.DataFrame, selected_ward: str) -> None:
-    color_map = {"Occupied": COLOR_OCCUPIED, "Free": COLOR_FREE}
+def _render_charts(beds_df: pd.DataFrame, resolved: pd.DataFrame, admissions_df: pd.DataFrame) -> None:
+    """Render the four charts from already ward-filtered frames.
+
+    Every series here is derived from the same numbers the metric tiles
+    use -- in particular out-of-service beds are their own category, not
+    silently folded into "Free", so a bar/segment can never disagree with
+    the Free Beds tile above it.
+    """
+    color_map = {"Occupied": COLOR_OCCUPIED, "Free": COLOR_FREE, "Out of Service": COLOR_OOS}
+    status_order = ["Occupied", "Free", "Out of Service"]
 
     chart_col1, chart_col2 = st.columns(2)
     occupied_ids: set = set(resolved["bed_id"].unique()) if not resolved.empty else set()
 
-    with chart_col1:
-        by_ward = beds_df.groupby("ward")["id"].count().rename("Total").reset_index()
-        occ_by_ward = beds_df.assign(is_occupied=beds_df["id"].isin(occupied_ids)).groupby("ward")["is_occupied"].sum()
-        by_ward["Occupied"] = by_ward["ward"].map(occ_by_ward).fillna(0).astype(int)
-        by_ward["Free"] = by_ward["Total"] - by_ward["Occupied"]
-        melted = by_ward.melt(id_vars="ward", value_vars=["Occupied", "Free"], var_name="Status", value_name="Beds")
-        fig = px.bar(
-            melted, x="ward", y="Beds", color="Status", barmode="stack",
-            color_discrete_map=color_map, title="ICU Occupancy by Ward",
+    if beds_df.empty:
+        with chart_col1:
+            st.info("No beds yet -- add beds in Manage Beds & Patients to populate the ward chart.")
+        with chart_col2:
+            st.info("No beds yet -- nothing to break down as occupied vs free.")
+    else:
+        by_bed = beds_df.assign(
+            _oos=beds_df["status"] == OUT_OF_SERVICE,
+            _occupied=beds_df["id"].isin(occupied_ids),
         )
-        fig.update_traces(marker_line_width=0)
-        fig.update_layout(xaxis_title="", yaxis_title="Beds")
-        _apply_chart_theme(fig)
-        st.plotly_chart(fig, width="stretch")
+        # An out-of-service bed is never counted as occupied *or* free --
+        # it is unavailable, matching services/occupancy.compute_occupancy.
+        by_bed["Status"] = "Free"
+        by_bed.loc[by_bed["_occupied"] & ~by_bed["_oos"], "Status"] = "Occupied"
+        by_bed.loc[by_bed["_oos"], "Status"] = OUT_OF_SERVICE
 
-    with chart_col2:
-        total_beds = len(beds_df) if selected_ward == "All Wards" else len(beds_df[beds_df["ward"] == selected_ward])
-        occupied = (
-            len(occupied_ids & set(beds_df[beds_df["ward"] == selected_ward]["id"]))
-            if selected_ward != "All Wards"
-            else len(occupied_ids)
-        )
-        free = max(total_beds - occupied, 0)
-        pie_df = pd.DataFrame({"Status": ["Occupied", "Free"], "Beds": [occupied, free]})
-        fig2 = go.Figure(
-            data=[go.Pie(
-                labels=pie_df["Status"], values=pie_df["Beds"], hole=0.6,
-                marker=dict(colors=[color_map["Occupied"], color_map["Free"]], line=dict(color="#ffffff", width=2)),
-                textinfo="value+percent",
-            )]
-        )
-        fig2.update_layout(title="Occupied vs Free (current filter)")
-        _apply_chart_theme(fig2, showlegend=True)
-        st.plotly_chart(fig2, width="stretch")
+        with chart_col1:
+            counts = by_bed.groupby(["ward", "Status"]).size().reset_index(name="Beds")
+            fig = px.bar(
+                counts, x="ward", y="Beds", color="Status", barmode="stack",
+                color_discrete_map=color_map, category_orders={"Status": status_order},
+                title="ICU Occupancy by Ward",
+            )
+            fig.update_traces(marker_line_width=0)
+            fig.update_layout(xaxis_title="", yaxis_title="Beds")
+            fig.update_yaxes(dtick=1)
+            _apply_chart_theme(fig)
+            st.plotly_chart(fig, width="stretch")
+
+        with chart_col2:
+            split = by_bed["Status"].value_counts()
+            labels = [s for s in status_order if split.get(s, 0) > 0]
+            values = [int(split[s]) for s in labels]
+            fig2 = go.Figure(
+                data=[go.Pie(
+                    labels=labels, values=values, hole=0.6,
+                    marker=dict(colors=[color_map[s] for s in labels], line=dict(color="#ffffff", width=2)),
+                    sort=False,
+                    textinfo="value+percent",
+                )]
+            )
+            fig2.update_layout(title="Bed availability (current filter)")
+            _apply_chart_theme(fig2, showlegend=True)
+            st.plotly_chart(fig2, width="stretch")
 
     chart_col3, chart_col4 = st.columns(2)
 
